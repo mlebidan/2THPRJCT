@@ -1,0 +1,612 @@
+desc:2TH Chords
+// author: 2THPRJCT
+// v2.9 - chord trigger + strum engine
+
+slider1:0<0,50,1>Velocity Spread (+/-)
+slider2:100<0,200,1>Velocity Scale (%)
+slider3:0<0,500,1>Strum Spread (ms)
+slider4:0<0,2,1{Up,Down,Random}>Strum Direction
+slider5:0<0,100,1>Humanize Timing (ms)
+slider6:0<0,64,1>Strum Vel Spread
+slider7:0<-64,64,1>Strum Vel Base
+slider8:0<0,2,1{Linear,Exp Up,Exp Down}>Strum Vel Curve
+slider9:0<0,64,1>Humanize Velocity
+
+in_pin:none
+out_pin:none
+
+// ============================================================
+@init
+// ============================================================
+
+ext_noinit     = 1;
+gfx_ext_retina = 1;
+gfx_clear      = 0;
+
+MAX_NOTES = 128;
+MAX_CHORD = 16;
+EMPTY     = -1;
+
+// Memory layout
+// chord_data : 128*16 = 2048  -> 0..2047
+// active_src : 128*16 = 2048  -> 2048..4095
+// active_ref : 128            -> 4096..4223
+// clipboard  : 16             -> 4224..4239
+// live_note  : 128            -> 4240..4367
+// pq         : 2048*4 = 8192  -> 4500..12691
+// pq_head/tail/gsamp          -> 13000..13002
+// ST_N/ST_V  : 16 each        -> 13100..13131
+
+chord_data = 0;
+active_src = 2048;
+active_ref = 4096;
+clipboard  = 4224;
+live_note  = 4240;
+
+MAX_PQ = 2048;
+PQ_STR = 4;
+pq     = 4500;
+
+pq_head = 13000;
+pq_tail = 13001;
+gsamp   = 13002;
+ST_N    = 13100;
+ST_V    = 13120;
+
+memset(chord_data, EMPTY, MAX_NOTES * MAX_CHORD);
+memset(active_src, EMPTY, MAX_NOTES * MAX_CHORD);
+memset(active_ref, 0,     MAX_NOTES);
+memset(clipboard,  EMPTY, MAX_CHORD);
+memset(live_note,  0,     MAX_NOTES);
+memset(pq,         0,     MAX_PQ * PQ_STR);
+pq_head[0] = 0;
+pq_tail[0] = 0;
+gsamp[0]   = 0;
+
+sel_trig      = 36;
+copy_src_note = EMPTY;
+last_cap      = 0;
+msg_timer     = 0;
+msg_str       = "";
+do_panic      = 0;
+
+// String buffers — defined once, never reallocated
+note_buf = "";
+nb_str   = "";
+trig_lbl = "";
+chs      = "";
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+function clamp(v,lo,hi) ( v<lo?lo:v>hi?hi:v; );
+
+function is_black(n) local(r)
+( r=n%12; r==1||r==3||r==6||r==8||r==10; );
+
+function wkb(n) local(i,c)
+( c=0;i=0; loop(n, is_black(i)?0:(c+=1);i+=1;); c; );
+
+function wkin(a,b) local(i,c)
+( c=0;i=a; loop(b-a+1, is_black(i)?0:(c+=1);i+=1;); c; );
+
+// nname : writes note name into note_buf.
+// Use IMMEDIATELY before gfx_drawstr — never call gfx_measurestr on note_buf.
+function nname(n) local(r,o)
+(
+  r=n%12; o=(n/12)-2;
+  r==0?sprintf(note_buf,"C%d",o)  :r==1?sprintf(note_buf,"C#%d",o):
+  r==2?sprintf(note_buf,"D%d",o)  :r==3?sprintf(note_buf,"D#%d",o):
+  r==4?sprintf(note_buf,"E%d",o)  :r==5?sprintf(note_buf,"F%d",o) :
+  r==6?sprintf(note_buf,"F#%d",o) :r==7?sprintf(note_buf,"G%d",o) :
+  r==8?sprintf(note_buf,"G#%d",o) :r==9?sprintf(note_buf,"A%d",o) :
+  r==10?sprintf(note_buf,"A#%d",o):sprintf(note_buf,"B%d",o);
+);
+
+function has_chord(n) local(s,f)
+( f=0;s=0;loop(MAX_CHORD,chord_data[n*MAX_CHORD+s]>=0?f=1;s+=1;);f; );
+
+// ── Output queue ─────────────────────────────────────────────────
+// Unsorted circular queue.
+// isoff: 0=Note On pending, 1=Note Off pending, 2=skip, 3=done
+
+function pq_insert(nt,vel,fs,isoff) local(t)
+(
+  t=pq_tail[0];
+  pq[t*PQ_STR+0]=nt; pq[t*PQ_STR+1]=vel;
+  pq[t*PQ_STR+2]=fs; pq[t*PQ_STR+3]=isoff;
+  pq_tail[0]=(t+1)%MAX_PQ;
+);
+
+// Flush all pending Note Ons and silence all active notes.
+// Called on every new trigger Note On to ensure a clean start.
+function flush_and_silence(now_ofs) local(rd,cn)
+(
+  rd=pq_head[0];
+  while(rd!=pq_tail[0])
+  (
+    pq[rd*PQ_STR+3]==0 ? pq[rd*PQ_STR+3]=2;
+    rd=(rd+1)%MAX_PQ;
+  );
+  cn=0; loop(MAX_NOTES,
+    active_ref[cn]>0 ?
+    ( midisend(now_ofs,$x80,cn,0); active_ref[cn]=0; );
+    cn+=1;
+  );
+);
+
+// ── Panic ────────────────────────────────────────────────────────
+
+function do_panic_fn() local(ch)
+(
+  ch=0; loop(16,
+    midisend(0,$xB0|ch,123,0);
+    midisend(0,$xB0|ch,120,0);
+    ch+=1;
+  );
+  memset(active_ref,0,MAX_NOTES);
+  memset(active_src,EMPTY,MAX_NOTES*MAX_CHORD);
+  memset(live_note,0,MAX_NOTES);
+  pq_head[0]=0; pq_tail[0]=0;
+  memset(pq,0,MAX_PQ*PQ_STR);
+  strcpy(msg_str,"PANIC - all notes off."); msg_timer=180;
+);
+
+// ── Chord sort ───────────────────────────────────────────────────
+
+function chord_sort(trig) local(s,d,a,b,chg)
+(
+  d=0;s=0;
+  loop(MAX_CHORD,
+    chord_data[trig*MAX_CHORD+s]>=0?
+    (chord_data[trig*MAX_CHORD+d]=chord_data[trig*MAX_CHORD+s];d+=1;);s+=1;);
+  loop(MAX_CHORD-d,chord_data[trig*MAX_CHORD+d]=EMPTY;d+=1;);
+  chg=1;
+  while(chg)(chg=0;s=0;
+    loop(MAX_CHORD-1,
+      a=chord_data[trig*MAX_CHORD+s];b=chord_data[trig*MAX_CHORD+s+1];
+      a>=0&&b>=0&&a>b?(chord_data[trig*MAX_CHORD+s]=b;
+                       chord_data[trig*MAX_CHORD+s+1]=a;chg=1;);s+=1;););
+);
+
+// ── Strum engine ─────────────────────────────────────────────────
+
+function strum_fire(sn,sv,sc,base) local(i,j,lo,hi,tmp,t,ht,dms,dsmp,vs,hv,nv,fire)
+(
+  sc<=0?0:(
+    str_dir==1?(
+      lo=0;hi=sc-1;
+      while(lo<hi)(
+        tmp=sn[lo];sn[lo]=sn[hi];sn[hi]=tmp;
+        tmp=sv[lo];sv[lo]=sv[hi];sv[hi]=tmp;
+        lo+=1;hi-=1;);
+    ):str_dir==2?(
+      i=sc-1;loop(sc-1,
+        j=floor(rand(i+1));
+        tmp=sn[i];sn[i]=sn[j];sn[j]=tmp;
+        tmp=sv[i];sv[i]=sv[j];sv[j]=tmp;
+        i-=1;);
+    );
+    i=0;loop(sc,
+      t=sc>1?i/(sc-1):0;
+      ht=str_hum_t>0?rand(str_hum_t*2)-str_hum_t:0;
+      dms=max(0,str_sprd_ms*t+ht);
+      dsmp=floor(dms*0.001*srate+0.5);
+      fire=base+dsmp;
+      str_vcurve==0?(vs=str_vsprd*t;):
+      str_vcurve==1?(vs=str_vsprd*t*t;):
+                    (vs=str_vsprd*(1-(1-t)*(1-t)););
+      hv=str_hum_v>0?rand(str_hum_v*2)-str_hum_v:0;
+      nv=clamp(floor(sv[i]+str_vbase+vs+hv+0.5),1,127);
+      pq_insert(sn[i],nv,fire,0);
+      i+=1;
+    );
+  );
+);
+
+// ============================================================
+@serialize
+file_mem(0, chord_data, MAX_NOTES * MAX_CHORD);
+
+// ============================================================
+@slider
+vspread     = slider1|0;
+vscale      = slider2*0.01;
+str_sprd_ms = slider3;
+str_dir     = floor(slider4+0.5);
+str_hum_t   = slider5;
+str_vsprd   = slider6;
+str_vbase   = slider7;
+str_vcurve  = floor(slider8+0.5);
+str_hum_v   = slider9;
+
+// ============================================================
+@block
+// ============================================================
+
+do_panic?(do_panic_fn();do_panic=0;);
+
+gsamp[0]+=samplesblock;
+blk0=gsamp[0]-samplesblock;
+
+vspread     = slider1|0;
+vscale      = slider2*0.01;
+str_sprd_ms = slider3;
+str_dir     = floor(slider4+0.5);
+str_hum_t   = slider5;
+str_vsprd   = slider6;
+str_vbase   = slider7;
+str_vcurve  = floor(slider8+0.5);
+str_hum_v   = slider9;
+
+// Drain queue: scan all slots, fire those due this block
+rd_scan=pq_head[0];
+while(rd_scan!=pq_tail[0])
+(
+  pe_isof=pq[rd_scan*PQ_STR+3];
+  pe_fire=pq[rd_scan*PQ_STR+2];
+  pe_isof!=2&&pe_isof!=3&&pe_fire<gsamp[0]?
+  (
+    pe_nt =pq[rd_scan*PQ_STR+0];
+    pe_vel=pq[rd_scan*PQ_STR+1];
+    pe_ofs=clamp(pe_fire-blk0,0,samplesblock-1);
+    pe_isof==0?
+    ( midisend(pe_ofs,$x90,pe_nt,pe_vel); active_ref[pe_nt]+=1; ):
+    pe_isof==1?
+    ( active_ref[pe_nt]>0?
+      ( active_ref[pe_nt]-=1;
+        active_ref[pe_nt]==0?midisend(pe_ofs,$x80,pe_nt,0); ); );
+    pq[rd_scan*PQ_STR+3]=3;
+  );
+  rd_scan=(rd_scan+1)%MAX_PQ;
+);
+while(pq_head[0]!=pq_tail[0]&&
+      (pq[pq_head[0]*PQ_STR+3]==3||pq[pq_head[0]*PQ_STR+3]==2))
+( pq_head[0]=(pq_head[0]+1)%MAX_PQ; );
+
+// MIDI input
+while(midirecv(offset,msg1,msg2,msg3))
+(
+  st=msg1&$xF0; nt=msg2; vl=msg3;
+
+  st==$x90&&vl>0?
+  (
+    live_note[nt]=1;
+    sel_trig=nt;
+    now=blk0+offset;
+
+    // Flush previous chord and silence all active notes
+    flush_and_silence(offset);
+    memset(active_src,EMPTY,MAX_NOTES*MAX_CHORD);
+
+    // Build and fire new strum chord
+    sc=0;s=0;
+    loop(MAX_CHORD,
+      cn=chord_data[nt*MAX_CHORD+s];
+      cn>=0?
+      ( rv=vspread>0?clamp(vl+((rand(vspread*2)|0)-vspread),1,127):vl;
+        ov=clamp((rv*vscale)|0,1,127);
+        ST_N[sc]=cn;ST_V[sc]=ov;
+        active_src[nt*MAX_CHORD+s]=cn;
+        sc+=1; );
+      s+=1;
+    );
+    sc>0?strum_fire(ST_N,ST_V,sc,now);
+
+  ):
+  (st==$x80||(st==$x90&&vl==0))?
+  (
+    live_note[nt]=0;
+    s=0;loop(MAX_CHORD,
+      cn=active_src[nt*MAX_CHORD+s];
+      cn>=0?
+      ( rd_scan=pq_head[0];
+        while(rd_scan!=pq_tail[0])
+        ( pq[rd_scan*PQ_STR+0]==cn&&pq[rd_scan*PQ_STR+3]==0?
+            pq[rd_scan*PQ_STR+3]=2;
+          rd_scan=(rd_scan+1)%MAX_PQ; );
+        active_ref[cn]>0?
+        ( midisend(offset,$x80,cn,0);active_ref[cn]=0; );
+        active_src[nt*MAX_CHORD+s]=EMPTY;
+      );
+      s+=1;
+    );
+  ):
+  ( midisend(offset,msg1,msg2,msg3); );
+);
+
+// ============================================================
+@gfx 860 480
+// ============================================================
+
+// ── GFX utility functions (defined first, before any call) ───
+
+function rc(r,g,b)    ( gfx_r=r;gfx_g=g;gfx_b=b;gfx_a=1.0; );
+function rca(r,g,b,a) ( gfx_r=r;gfx_g=g;gfx_b=b;gfx_a=a;   );
+function rf(x,y,w,h)  ( gfx_rect(x,y,w,h,1); );
+
+GW=gfx_w; GH=gfx_h;
+SC=GW/860.0; SC<0.35?SC=0.35;
+function S(v) ( (v*SC)|0; );
+
+// ── Font slots — configured once when SC changes ─────────────
+// Uses pre-configured slots (idx 2..11) to avoid per-frame
+// font creation which causes visual glitches.
+abs(SC-last_SC)>0.001?
+(
+  last_SC=SC;
+  gfx_setfont(2,  "Courier New", max(1,S(11)), 0);   // F_SM
+  gfx_setfont(3,  "Courier New", max(1,S(14)), 0);   // F_MD
+  gfx_setfont(4,  "Courier New", max(1,S(17)), 0);   // F_LG
+  gfx_setfont(5,  "Courier New", max(1,S(17)), 'b'); // F_LGB
+  gfx_setfont(6,  "Courier New", max(1,S(27)), 'b'); // F_HDR
+  gfx_setfont(7,  "Courier New", max(1,S(17)), 0);   // F_SUB
+  gfx_setfont(8,  "Courier New", max(1,S(15)), 'b'); // F_BDG
+  gfx_setfont(9,  "Courier New", max(1,S(15)), 'b'); // F_LBL
+  gfx_setfont(10, "Courier New", max(1,S(14)), 0);   // F_LEG
+  gfx_setfont(11, "Courier New", max(1,S(13)), 0);   // F_SB
+);
+F_SM=2;F_MD=3;F_LG=4;F_LGB=5;F_HDR=6;
+F_SUB=7;F_BDG=8;F_LBL=9;F_LEG=10;F_SB=11;
+
+// ── draw_keyboard ────────────────────────────────────────────
+// RULE: nname() writes into note_buf.
+//       Call gfx_drawstr(note_buf) IMMEDIATELY after.
+//       NEVER call gfx_measurestr(note_buf) — it corrupts the buffer.
+//       White key labels are left-aligned (no measurestr needed).
+function draw_keyboard(kx,ky,kw,kh,ns,ne,is_trig)
+  local(tw,ww,bkw,bkh,wx,i,ot,oc,thc,lv,s2,bx)
+(
+  hit_note=-1;
+  tw=wkin(ns,ne); tw<=0?tw=1;
+  ww=kw/tw; bkw=ww*0.62; bkh=kh*0.60;
+
+  // White keys
+  gfx_setfont(F_MD);
+  wx=kx;i=ns;
+  loop(ne-ns+1,
+    !is_black(i)?(
+      ot=(is_trig&&i==sel_trig);
+      oc=0;s2=0;loop(MAX_CHORD,chord_data[sel_trig*MAX_CHORD+s2]==i?oc=1;s2+=1;);
+      thc=(is_trig&&has_chord(i));
+      lv=(is_trig&&live_note[i]);
+      (mouse_x>=wx&&mouse_x<wx+ww&&mouse_y>=ky&&mouse_y<ky+kh)?hit_note=i;
+      ot?rc(C_AM_R,C_AM_G,C_AM_B):
+      lv?rc(C_LV_R,C_LV_G,C_LV_B):
+      (!is_trig&&oc)?rc(C_AC_R,C_AC_G,C_AC_B):
+      thc?rc(C_GN_R*0.72,C_GN_G*0.78,C_GN_B*0.58):
+          rc(C_WK_R,C_WK_G,C_WK_B);
+      rf(wx+1,ky+1,ww-2,kh-2);
+      rc(C_SP_R,C_SP_G,C_SP_B);rf(wx,ky,1,kh);
+      (i%12==0||ot||(!is_trig&&oc)||lv)?(
+        nname(i);
+        (ot||(!is_trig&&oc)||lv)?rc(0.05,0.05,0.07):rc(0.45,0.45,0.47);
+        gfx_x=wx+S(2);gfx_y=ky+kh-S(16);gfx_drawstr(note_buf););
+      wx+=ww;
+    );
+    i+=1;
+  );
+
+  // Black keys
+  gfx_setfont(F_SM);
+  wx=kx;i=ns;
+  loop(ne-ns+1,
+    is_black(i)?(
+      bx=wx-bkw*0.5;
+      ot=(is_trig&&i==sel_trig);
+      oc=0;s2=0;loop(MAX_CHORD,chord_data[sel_trig*MAX_CHORD+s2]==i?oc=1;s2+=1;);
+      thc=(is_trig&&has_chord(i));
+      lv=(is_trig&&live_note[i]);
+      (mouse_x>=bx&&mouse_x<bx+bkw&&mouse_y>=ky&&mouse_y<ky+bkh)?hit_note=i;
+      ot?rc(C_AM_R*0.75,C_AM_G*0.55,C_AM_B*0.05):
+      lv?rc(C_LV_R*0.80,C_LV_G*0.25,C_LV_B*0.25):
+      (!is_trig&&oc)?rc(C_AC_R*0.55,C_AC_G*0.65,C_AC_B):
+      thc?rc(C_GN_R*0.30,C_GN_G*0.45,C_GN_B*0.28):
+          rc(C_BK_R,C_BK_G,C_BK_B);
+      rf(bx,ky,bkw,bkh);
+      (ot||(!is_trig&&oc)||lv)?(
+        nname(i);
+        rc(0.92,0.92,0.92);
+        gfx_x=bx+S(1);gfx_y=ky+bkh-S(12);gfx_drawstr(note_buf);
+      ):(rca(1,1,1,0.08);rf(bx+1,ky+1,bkw-2,2););
+    ):(wx+=ww;);
+    i+=1;
+  );
+);
+
+// ════════════════════════════════════════════════════════════
+// RENDER
+// ════════════════════════════════════════════════════════════
+
+// Color palette
+C_BG_R=0.10;C_BG_G=0.10;C_BG_B=0.11;
+C_PN_R=0.14;C_PN_G=0.14;C_PN_B=0.16;
+C_AC_R=0.20;C_AC_G=0.57;C_AC_B=0.88;
+C_AM_R=0.95;C_AM_G=0.68;C_AM_B=0.15;
+C_GN_R=0.22;C_GN_G=0.78;C_GN_B=0.42;
+C_LV_R=0.90;C_LV_G=0.30;C_LV_B=0.30;
+C_TX_R=0.88;C_TX_G=0.88;C_TX_B=0.88;
+C_DM_R=0.42;C_DM_G=0.42;C_DM_B=0.44;
+C_WK_R=0.91;C_WK_G=0.91;C_WK_B=0.89;
+C_BK_R=0.13;C_BK_G=0.13;C_BK_B=0.15;
+C_SP_R=0.22;C_SP_G=0.22;C_SP_B=0.25;
+C_OK_R=0.18;C_OK_G=0.72;C_OK_B=0.40;
+
+rc(C_BG_R,C_BG_G,C_BG_B);rf(0,0,GW,GH);
+
+// Header
+HDR_H=S(40);
+rc(C_AC_R*0.28,C_AC_G*0.28,C_AC_B*0.28);rf(0,0,GW,HDR_H);
+rc(C_AC_R,C_AC_G,C_AC_B);rf(0,0,S(4),HDR_H);
+gfx_setfont(F_HDR);
+rc(C_TX_R,C_TX_G,C_TX_B);gfx_x=S(14);gfx_y=S(7);gfx_drawstr("2TH CHORDS");
+gfx_setfont(F_SUB);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_x=S(200);gfx_y=S(12);
+gfx_drawstr("chord trigger + strum  //  v2.9");
+
+// Note count badge (top right)
+acn=0;xb=0;loop(MAX_CHORD,chord_data[sel_trig*MAX_CHORD+xb]>=0?acn+=1;xb+=1;);
+gfx_setfont(F_BDG);
+acn>0?rc(C_AC_R,C_AC_G,C_AC_B):rc(C_DM_R,C_DM_G,C_DM_B);
+sprintf(nb_str,"%d/16 notes",acn);
+gfx_x=GW-S(90);gfx_y=S(11);gfx_drawstr(nb_str);
+
+// Layout
+PAD=S(10);KB_W=GW-PAD*2;KB_ST=24;KB_END=95;
+KB_H=S(118);OCT_H=S(18);INFO_H=S(26);LBL_H=S(20);
+LEG_H=S(20);BTN_H=S(30);SB_H=S(22);
+Y_INFO=HDR_H+S(5);
+Y_LBL1=Y_INFO+INFO_H+S(2);
+Y_LEG=Y_LBL1+LBL_H;
+Y_KB1=Y_LEG+LEG_H+S(2);
+Y_OCT1=Y_KB1+KB_H;
+Y_LBL2=Y_OCT1+OCT_H+S(3);
+Y_KB2=Y_LBL2+LBL_H;
+Y_OCT2=Y_KB2+KB_H;
+Y_BTN=Y_OCT2+OCT_H+S(8);
+Y_SB=GH-SB_H;
+
+// Trigger info bar
+nname(sel_trig);strcpy(trig_lbl,note_buf);
+strcpy(chs,"");xb=0;
+loop(MAX_CHORD,
+  cn=chord_data[sel_trig*MAX_CHORD+xb];
+  cn>=0?(nname(cn);chs==""?strcpy(chs,note_buf):(strcat(chs," + ");strcat(chs,note_buf);););
+  xb+=1;
+);
+gfx_setfont(F_LGB);
+rc(C_AM_R,C_AM_G,C_AM_B);gfx_x=PAD;gfx_y=Y_INFO;gfx_drawstr("TRIGGER ");
+rc(C_TX_R,C_TX_G,C_TX_B);gfx_drawstr(trig_lbl);
+gfx_setfont(F_LG);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_drawstr("  ->  ");
+chs==""?
+  (rc(C_DM_R,C_DM_G,C_DM_B);gfx_drawstr("(empty -- click chord keyboard below)");):
+  (rc(C_AC_R,C_AC_G,C_AC_B);gfx_setfont(F_LGB);gfx_drawstr(chs););
+
+// Section label: trigger keys
+gfx_setfont(F_LBL);
+rc(C_DM_R,C_DM_G,C_DM_B);
+gfx_x=PAD;gfx_y=Y_LBL1;gfx_drawstr(">> TRIGGER KEYS  (click to select)");
+
+// Legend
+gfx_setfont(F_LEG);
+lgtxt1=" selected  ";lgtxt2=" has chord  ";lgtxt3=" chord note";
+lbltxt1="[amber]";lbltxt2="[green]";lbltxt3="[blue]";
+gfx_measurestr(lbltxt1,lw1,lh1);gfx_measurestr(lgtxt1,lw2,lh2);
+gfx_measurestr(lbltxt2,lw3,lh3);gfx_measurestr(lgtxt2,lw4,lh4);
+gfx_measurestr(lbltxt3,lw5,lh5);gfx_measurestr(lgtxt3,lw6,lh6);
+leg_total=lw1+lw2+lw3+lw4+lw5+lw6;
+leg_x0=GW-PAD-leg_total;leg_x0<PAD?leg_x0=PAD;
+gfx_x=leg_x0;gfx_y=Y_LEG+(LEG_H-lh1)/2;
+rc(C_AM_R,C_AM_G,C_AM_B);gfx_drawstr(lbltxt1);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_drawstr(lgtxt1);
+rc(C_GN_R*0.80,C_GN_G*0.88,C_GN_B*0.65);gfx_drawstr(lbltxt2);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_drawstr(lgtxt2);
+rc(C_AC_R,C_AC_G,C_AC_B);gfx_drawstr(lbltxt3);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_drawstr(lgtxt3);
+
+// Section label: chord notes
+gfx_setfont(F_LBL);
+rc(C_DM_R,C_DM_G,C_DM_B);
+gfx_x=PAD;gfx_y=Y_LBL2;gfx_drawstr(">> CHORD NOTES   (click to toggle)");
+
+// Keyboard panels
+rc(C_PN_R,C_PN_G,C_PN_B);
+rf(PAD-S(2),Y_KB1-S(2),KB_W+S(4),KB_H+S(4));
+rf(PAD-S(2),Y_KB2-S(2),KB_W+S(4),KB_H+S(4));
+rc(C_AM_R,C_AM_G,C_AM_B);rf(PAD-S(2),Y_KB1-S(2),S(3),KB_H+S(4));
+rc(C_AC_R,C_AC_G,C_AC_B);rf(PAD-S(2),Y_KB2-S(2),S(3),KB_H+S(4));
+draw_keyboard(PAD,Y_KB1,KB_W,KB_H,KB_ST,KB_END,1);hit_top=hit_note;
+draw_keyboard(PAD,Y_KB2,KB_W,KB_H,KB_ST,KB_END,0);hit_bot=hit_note;
+
+// Octave guide lines
+rc(C_SP_R+0.16,C_SP_G+0.16,C_SP_B+0.16);
+twtot=wkin(KB_ST,KB_END);wwpx=KB_W/twtot;xon=0;
+loop(11,
+  mc_n=xon*12;
+  (mc_n>=KB_ST&&mc_n<=KB_END)?(
+    cx=PAD+wkb(mc_n)*wwpx-wkb(KB_ST)*wwpx;
+    rf(cx,Y_KB1,1,S(7));rf(cx,Y_KB2,1,S(7)););
+  xon+=1;
+);
+
+// Buttons
+CLR_X=PAD;          CLR_W=S(95);
+CPY_X=CLR_X+S(106); CPY_W=S(85);
+PST_X=CPY_X+S(96);  PST_W=S(85);
+PNK_X=PST_X+PST_W+S(20); PNK_W=S(100);
+
+gfx_setfont(F_LGB);
+rc(0.32,0.10,0.10);rf(CLR_X,Y_BTN,CLR_W,BTN_H);
+rc(0.95,0.40,0.40);
+gfx_measurestr("CLEAR",bw2,bh2);
+gfx_x=CLR_X+(CLR_W-bw2)/2;gfx_y=Y_BTN+(BTN_H-bh2)/2;gfx_drawstr("CLEAR");
+
+rc(0.10,0.18,0.30);rf(CPY_X,Y_BTN,CPY_W,BTN_H);
+rc(C_AC_R,C_AC_G,C_AC_B);
+gfx_measurestr("COPY",bw2,bh2);
+gfx_x=CPY_X+(CPY_W-bw2)/2;gfx_y=Y_BTN+(BTN_H-bh2)/2;gfx_drawstr("COPY");
+
+rc(0.10,0.26,0.13);rf(PST_X,Y_BTN,PST_W,BTN_H);
+rc(0.35,0.88,0.45);
+gfx_measurestr("PASTE",bw2,bh2);
+gfx_x=PST_X+(PST_W-bw2)/2;gfx_y=Y_BTN+(BTN_H-bh2)/2;gfx_drawstr("PASTE");
+
+rc(0.45,0.08,0.08);rf(PNK_X,Y_BTN,PNK_W,BTN_H);
+rc(1.0,0.50,0.50);
+gfx_measurestr("PANIC !",bw2,bh2);
+gfx_x=PNK_X+(PNK_W-bw2)/2;gfx_y=Y_BTN+(BTN_H-bh2)/2;gfx_drawstr("PANIC !");
+
+// Clipboard indicator
+copy_src_note>=0?(
+  nname(copy_src_note);sprintf(nb_str,"buf: %s",note_buf);
+  gfx_setfont(F_BDG);rc(C_DM_R,C_DM_G,C_DM_B);
+  gfx_x=PST_X+PST_W+S(12);gfx_y=Y_BTN+(BTN_H-S(15))/2;gfx_drawstr(nb_str););
+
+// Status message
+msg_timer>0?(
+  rc(C_OK_R,C_OK_G,C_OK_B);gfx_setfont(F_LG);
+  gfx_x=PAD;gfx_y=Y_BTN+BTN_H+S(4);gfx_drawstr(msg_str);msg_timer-=1;);
+
+// Status bar
+rc(0.08,0.08,0.09);rf(0,Y_SB,GW,SB_H);
+rc(C_SP_R,C_SP_G,C_SP_B);rf(0,Y_SB,GW,1);
+ut=0;ii=0;loop(MAX_NOTES,has_chord(ii)?ut+=1;ii+=1;);
+gfx_setfont(F_SB);
+rc(C_DM_R,C_DM_G,C_DM_B);gfx_x=S(10);gfx_y=Y_SB+S(4);
+sprintf(nb_str,"Chords: %d/128    Notes/chord: %d max    Vel spread: %d    Scale: %.0f%%    Strum: %dms",
+        ut,MAX_CHORD,slider1|0,slider2,slider3|0);
+gfx_drawstr(nb_str);
+
+// Mouse clicks
+mc=(mouse_cap&1)&&!(last_cap&1);
+mc?(
+  hit_top>=0?sel_trig=hit_top;
+  hit_bot>=0?(
+    fnd=-1;fem=-1;xb=0;
+    loop(MAX_CHORD,
+      chord_data[sel_trig*MAX_CHORD+xb]==hit_bot?fnd=xb;
+      (fem<0&&chord_data[sel_trig*MAX_CHORD+xb]<0)?fem=xb;
+      xb+=1;
+    );
+    fnd>=0?(chord_data[sel_trig*MAX_CHORD+fnd]=EMPTY;chord_sort(sel_trig);):
+    fem>=0?(chord_data[sel_trig*MAX_CHORD+fem]=hit_bot;chord_sort(sel_trig);););
+
+  (mouse_x>=CLR_X&&mouse_x<CLR_X+CLR_W&&mouse_y>=Y_BTN&&mouse_y<Y_BTN+BTN_H)?(
+    xb=0;loop(MAX_CHORD,chord_data[sel_trig*MAX_CHORD+xb]=EMPTY;xb+=1;);
+    strcpy(msg_str,"Chord cleared.");msg_timer=130;);
+
+  (mouse_x>=CPY_X&&mouse_x<CPY_X+CPY_W&&mouse_y>=Y_BTN&&mouse_y<Y_BTN+BTN_H)?(
+    xb=0;loop(MAX_CHORD,clipboard[xb]=chord_data[sel_trig*MAX_CHORD+xb];xb+=1;);
+    copy_src_note=sel_trig;nname(sel_trig);
+    sprintf(msg_str,"Copied from %s.",note_buf);msg_timer=130;);
+
+  (mouse_x>=PST_X&&mouse_x<PST_X+PST_W&&mouse_y>=Y_BTN&&mouse_y<Y_BTN+BTN_H)?(
+    copy_src_note>=0?(
+      xb=0;loop(MAX_CHORD,chord_data[sel_trig*MAX_CHORD+xb]=clipboard[xb];xb+=1;);
+      nname(sel_trig);sprintf(msg_str,"Pasted to %s.",note_buf);msg_timer=130;):
+    (strcpy(msg_str,"Nothing in clipboard.");msg_timer=130;););
+
+  (mouse_x>=PNK_X&&mouse_x<PNK_X+PNK_W&&mouse_y>=Y_BTN&&mouse_y<Y_BTN+BTN_H)?(
+    do_panic=1;);
+);
+last_cap=mouse_cap;

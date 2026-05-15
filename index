@@ -1,1 +1,24 @@
-ertetu
+<?xml version="1.0" encoding="utf-8"?>
+<index version="1.0" name="2THPRJCT">
+
+  <!-- Scripts -->
+  <category name="sub folder name here">
+    <reapack name="script name" type="script" desc="script name">
+     <version name="1.0" author="your name here" time="08-06-2025">
+        <source main="main">paste raw link here</source>
+      </version>
+    </reapack>
+  </category>
+
+  <!-- Effects -->
+  <category name="JSFX/MIDI">
+    <reapack name="2TH_Chords.jsfx" type="effect" desc="2TH_Chords.jsfx">
+      <version name="2.9" author="2THPRJCT" time="15-05-2026">
+        <source main="main">https://github.com/mlebidan/2THPRJCT/raw/refs/heads/main/JSFX/MIDI/2TH_Chords.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+
+</index>
+
+
